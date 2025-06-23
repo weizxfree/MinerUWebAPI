@@ -1,0 +1,75 @@
+# Mac 专用 Dockerfile - 支持 Intel 和 Apple Silicon
+# 使用多架构基础镜像
+FROM --platform=linux/amd64 ubuntu:22.04
+
+# 设置时区
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+# 设置构建参数
+ARG INSTALL_TYPE=core
+ARG http_proxy
+ARG https_proxy
+
+# 安装系统依赖（Mac 优化版）
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-dev \
+    python3-venv \
+    git \
+    wget \
+    curl \
+    build-essential \
+    pkg-config \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libgomp1 \
+    libopencv-dev \
+    libffi-dev \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 设置pip镜像源（可选）
+RUN pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+RUN pip3 install --upgrade pip
+
+# 安装uv包管理器
+RUN pip3 install uv
+
+# 设置工作目录
+WORKDIR /app
+
+# 复制requirements文件
+COPY requirements.txt .
+
+# Mac 专用：强制使用 CPU 版本
+RUN if [ "$INSTALL_TYPE" = "all" ]; then \
+        echo "Installing mineru[core] for Mac (CPU only)..."; \
+        sed -i 's/mineru\[.*\]/mineru[core]/' requirements.txt; \
+    else \
+        echo "Installing mineru[core] for Mac (CPU only)..."; \
+        sed -i 's/mineru\[.*\]/mineru[core]/' requirements.txt; \
+    fi
+
+# 安装Python依赖
+RUN uv pip install --system -r requirements.txt
+
+# 复制应用代码
+COPY . .
+
+# Mac 环境变量设置
+ENV PYTHONPATH=/app
+ENV MINERU_MODEL_SOURCE=modelscope
+ENV MINERU_DEVICE_MODE=cpu
+ENV OMP_NUM_THREADS=4
+
+# 暴露端口
+EXPOSE 8888
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8888/docs || exit 1
+
+# 默认启动命令
+CMD ["python3", "app.py"] 

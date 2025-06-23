@@ -1,59 +1,70 @@
-FROM python:3.10-slim-bookworm AS base
+FROM nvidia/cuda:11.8-runtime-ubuntu22.04
 
+# 设置时区
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+# 设置构建参数，用于选择安装类型
+ARG INSTALL_TYPE=core
+ARG http_proxy
+ARG https_proxy
+
+# 安装系统依赖
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-dev \
+    git \
+    wget \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# 设置pip镜像源
+RUN pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+RUN pip3 install --upgrade pip
+
+# 安装uv包管理器
+RUN pip3 install uv
+
+# 设置工作目录
 WORKDIR /app
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    LANG=C.UTF-8 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1
-
-
-FROM base AS build
-
-# Update the package list and install necessary packages
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        build-essential && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-
-# Build Python dependencies
+# 复制requirements文件
 COPY requirements.txt .
-RUN python -m venv /app/venv && \
-    . /app/venv/bin/activate && \
-    pip install --no-cache-dir -r requirements.txt && \
-    find /app/venv -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 
-# Download models
-RUN . /app/venv/bin/activate && \
-    export HF_HOME=/opt/models && \
-    python -m mineru.cli.models_download --source huggingface --model_type all
+# 根据INSTALL_TYPE参数安装不同版本的mineru
+RUN if [ "$INSTALL_TYPE" = "all" ]; then \
+        echo "Installing mineru[all] for full functionality including sglang..."; \
+        sed -i 's/mineru\[.*\]/mineru[all]/' requirements.txt; \
+    elif [ "$INSTALL_TYPE" = "core" ]; then \
+        echo "Installing mineru[core] for basic functionality..."; \
+        sed -i 's/mineru\[.*\]/mineru[core]/' requirements.txt; \
+    else \
+        echo "Using default requirements.txt..."; \
+    fi
 
-FROM base AS prod
+# 安装Python依赖
+RUN uv pip install --system -r requirements.txt
 
-# Copy Python dependencies and models from the build stage
-COPY --from=build /app/venv /app/venv
-COPY --from=build /opt/models /opt/models
+# 复制应用代码
+COPY . .
 
-# Update the package list and install necessary packages
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        libgl1 \
-        libglib2.0-0 \
-        libgomp1 && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+# 预热模型（下载默认模型）
+RUN echo "Pre-downloading models..." && \
+    python3 -c "import os; os.environ['MINERU_MODEL_SOURCE'] = 'modelscope'" && \
+    if [ "$INSTALL_TYPE" = "all" ]; then \
+        mineru-models-download -s modelscope -m all || echo "Model download failed, will download on first use"; \
+    else \
+        mineru-models-download -s modelscope -m pipeline || echo "Model download failed, will download on first use"; \
+    fi
 
-# Copy the app and its configuration file
-COPY entrypoint.sh /app/entrypoint.sh
-COPY mineru.json /root/mineru.json
-COPY app.py /app/app.py
+# 设置环境变量
+ENV PYTHONPATH=/app
+ENV MINERU_MODEL_SOURCE=modelscope
 
-# Expose the port that FastAPI will run on
+# 暴露端口
 EXPOSE 8888
+EXPOSE 30000
 
-# Command to run FastAPI using Uvicorn, pointing to app.py and binding to 0.0.0.0:8000
-ENTRYPOINT [ "/app/entrypoint.sh" ]
-CMD ["--host", "0.0.0.0", "--port", "8888"]
+# 默认启动命令
+CMD ["python3", "app.py"]

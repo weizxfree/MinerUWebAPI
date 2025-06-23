@@ -17,6 +17,8 @@ from mineru.cli.common import convert_pdf_bytes_to_bytes_by_pypdfium2
 from mineru.backend.pipeline.pipeline_analyze import doc_analyze as pipeline_doc_analyze
 from mineru.backend.pipeline.model_json_to_middle_json import result_to_middle_json as pipeline_result_to_middle_json
 from mineru.backend.pipeline.pipeline_middle_json_mkcontent import union_make as pipeline_union_make
+from mineru.backend.vlm.vlm_analyze import doc_analyze as vlm_doc_analyze
+from mineru.backend.vlm.vlm_middle_json_mkcontent import union_make as vlm_union_make
 from mineru.utils.enum_class import MakeMode
 from mineru.utils.draw_bbox import draw_layout_bbox, draw_span_bbox
 
@@ -100,7 +102,7 @@ def init_writers(
     return writer, image_writer, file_bytes, file_extension
 
 
-def process_file_mineru(
+def process_file_pipeline(
     file_bytes: bytes,
     file_extension: str,
     image_writer: Union[S3DataWriter, FileBasedDataWriter],
@@ -109,6 +111,7 @@ def process_file_mineru(
     formula_enable: bool = True,
     table_enable: bool = True,
 ):
+    """Pipeline 模式处理函数"""
     processed_bytes = file_bytes
     if file_extension in pdf_extensions:
         processed_bytes = convert_pdf_bytes_to_bytes_by_pypdfium2(file_bytes, 0, None)
@@ -133,6 +136,41 @@ def process_file_mineru(
     return model_json, middle_json, content_list, md_content, processed_bytes, middle_json["pdf_info"]
 
 
+def process_file_vlm(
+    file_bytes: bytes,
+    file_extension: str,
+    image_writer: Union[S3DataWriter, FileBasedDataWriter],
+    backend: str = "transformers",
+    server_url: Optional[str] = None,
+):
+    """VLM 模式处理函数"""
+    processed_bytes = file_bytes
+    if file_extension in pdf_extensions:
+        processed_bytes = convert_pdf_bytes_to_bytes_by_pypdfium2(file_bytes, 0, None)
+    
+    # 使用 VLM 后端进行解析
+    middle_json, infer_result = vlm_doc_analyze(
+        processed_bytes, 
+        image_writer=image_writer, 
+        backend=backend, 
+        server_url=server_url
+    )
+    
+    pdf_info = middle_json["pdf_info"]
+    
+    # 生成 markdown 和内容列表
+    md_content = vlm_union_make(pdf_info, MakeMode.MM_MD, "images")
+    content_list = vlm_union_make(pdf_info, MakeMode.CONTENT_LIST, "images")
+    
+    # 构造类似于 pipeline 的 model_json 格式
+    model_json = {
+        "model_output": infer_result,
+        "backend": backend
+    }
+    
+    return model_json, middle_json, content_list, md_content, processed_bytes, pdf_info
+
+
 def encode_image(image_path: str) -> str:
     """Encode image using base64"""
     with open(image_path, "rb") as f:
@@ -147,10 +185,12 @@ def encode_image(image_path: str) -> str:
 async def file_parse(
     file: Optional[UploadFile] = None,
     file_path: Optional[str] = Form(None),
+    backend: str = Form("pipeline"),
     parse_method: str = Form("auto"),
     lang: str = Form("ch"),
     formula_enable: bool = Form(True),
     table_enable: bool = Form(True),
+    server_url: Optional[str] = Form(None),
     is_json_md_dump: bool = Form(False),
     output_dir: str = Form("output"),
     return_layout: bool = Form(False),
@@ -167,11 +207,14 @@ async def file_parse(
             `file_path`
         file_path: The path to the PDF file to be parsed. Must not be specified together
             with `file`
+        backend: Parsing backend, can be pipeline, vlm-transformers, vlm-sglang-engine, 
+            or vlm-sglang-client. Default is pipeline.
         parse_method: Parsing method, can be auto, ocr, or txt. Default is auto. If
-            results are not satisfactory, try ocr
-        lang: Language for parsing. Default is 'ch'.
-        formula_enable: Whether to enable formula parsing. Default to True.
-        table_enable: Whether to enable table parsing. Default to True.
+            results are not satisfactory, try ocr (only for pipeline backend)
+        lang: Language for parsing. Default is 'ch' (only for pipeline backend)
+        formula_enable: Whether to enable formula parsing. Default to True (only for pipeline backend)
+        table_enable: Whether to enable table parsing. Default to True (only for pipeline backend)
+        server_url: Server URL for vlm-sglang-client backend
         is_json_md_dump: Whether to write parsed data to .json and .md files. Default
             to False. Different stages of data will be written to different .json files
             (3 in total), md content will be saved to .md file
@@ -180,6 +223,7 @@ async def file_parse(
         return_layout: Whether to return parsed PDF layout. Default to False
         return_info: Whether to return parsed PDF info. Default to False
         return_content_list: Whether to return parsed PDF content list. Default to False
+        return_images: Whether to return images as base64. Default to False
     """
     try:
         if (file is None and file_path is None) or (
@@ -187,6 +231,21 @@ async def file_parse(
         ):
             return JSONResponse(
                 content={"error": "Must provide either file or file_path"},
+                status_code=400,
+            )
+
+        # 验证后端类型
+        supported_backends = ["pipeline", "vlm-transformers", "vlm-sglang-engine", "vlm-sglang-client"]
+        if backend not in supported_backends:
+            return JSONResponse(
+                content={"error": f"Unsupported backend: {backend}. Supported: {supported_backends}"},
+                status_code=400,
+            )
+
+        # 对于 vlm-sglang-client，server_url 是必需的
+        if backend == "vlm-sglang-client" and not server_url:
+            return JSONResponse(
+                content={"error": "server_url is required for vlm-sglang-client backend"},
                 status_code=400,
             )
 
@@ -219,10 +278,17 @@ async def file_parse(
                 status_code=400,
             )
 
-        # Process PDF
-        model_json, middle_json, content_list, md_content, processed_bytes, pdf_info = process_file_mineru(
-            file_bytes, file_extension, image_writer, parse_method, lang, formula_enable, table_enable
-        )
+        # Process file based on backend
+        if backend == "pipeline":
+            model_json, middle_json, content_list, md_content, processed_bytes, pdf_info = process_file_pipeline(
+                file_bytes, file_extension, image_writer, parse_method, lang, formula_enable, table_enable
+            )
+        else:
+            # VLM backends
+            vlm_backend = backend[4:] if backend.startswith("vlm-") else backend
+            model_json, middle_json, content_list, md_content, processed_bytes, pdf_info = process_file_vlm(
+                file_bytes, file_extension, image_writer, vlm_backend, server_url
+            )
 
         # If results need to be saved
         if is_json_md_dump:
@@ -237,8 +303,8 @@ async def file_parse(
                 f"{file_name}_model.json",
                 json.dumps(model_json, indent=4, ensure_ascii=False),
             )
-            # Save visualization results
-            if not isinstance(writer, S3DataWriter):
+            # Save visualization results (only for pipeline backend)
+            if backend == "pipeline" and not isinstance(writer, S3DataWriter):
                 draw_layout_bbox(pdf_info, processed_bytes, output_path, f"{file_name}_layout.pdf")
                 draw_span_bbox(pdf_info, processed_bytes, output_path, f"{file_name}_span.pdf")
 
@@ -264,6 +330,7 @@ async def file_parse(
                 data["images"] = {}
                 
         data["md_content"] = md_content  # md_content is always returned
+        data["backend"] = backend  # 返回使用的后端信息
 
         return JSONResponse(data, status_code=200)
 
