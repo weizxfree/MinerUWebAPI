@@ -1,4 +1,4 @@
-FROM nvidia/cuda:11.8-runtime-ubuntu22.04
+FROM nvidia/cuda:11.8.0-runtime-ubuntu22.04
 
 # 设置时区
 ENV TZ=Asia/Shanghai
@@ -49,11 +49,16 @@ RUN uv pip install --system -r requirements.txt
 # 复制应用代码
 COPY . .
 
+# 设置启动脚本权限
+RUN chmod +x start_services.sh
+
 # 预热模型（下载默认模型）
 RUN echo "Pre-downloading models..." && \
     python3 -c "import os; os.environ['MINERU_MODEL_SOURCE'] = 'modelscope'" && \
     if [ "$INSTALL_TYPE" = "all" ]; then \
-        mineru-models-download -s modelscope -m all || echo "Model download failed, will download on first use"; \
+        echo "Downloading VLM models for sglang-engine backend..." && \
+        mineru-models-download -s modelscope -m vlm || echo "VLM model download failed, will download on first use"; \
+        mineru-models-download -s modelscope -m pipeline || echo "Pipeline model download failed, will download on first use"; \
     else \
         mineru-models-download -s modelscope -m pipeline || echo "Model download failed, will download on first use"; \
     fi
@@ -67,4 +72,4 @@ EXPOSE 8888
 EXPOSE 30000
 
 # 默认启动命令
-CMD ["python3", "app.py"]
+CMD ["./start_services.sh"]
